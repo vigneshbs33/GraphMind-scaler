@@ -62,7 +62,15 @@ class SearchEvaluator:
             key=lambda item: item[1],
         )[0]
 
-        llm_answer = await self.llm.refine_results(hybrid_raw, payload.query)
+        # Generate explanation for comparison
+        llm_answer = await self.llm.explain_comparison(
+            payload.query,
+            vector_results,
+            graph_results,
+            hybrid_results,
+            winner,
+            metrics
+        )
 
         return ComparisonResponse(
             vector_results=vector_results,

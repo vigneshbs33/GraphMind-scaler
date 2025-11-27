@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
@@ -116,4 +117,85 @@ class ComparisonRequest(BaseModel):
     ground_truth_ids: List[str] = Field(default_factory=list)
     top_k: int = Field(default=settings.DEFAULT_TOP_K, ge=1, le=20)
     alpha: float = Field(default=settings.HYBRID_ALPHA, ge=0.0, le=1.0)
+
+
+class NodeUpdate(BaseModel):
+    """Payload for updating a graph node."""
+
+    content: Optional[str] = Field(default=None, max_length=10_000, description="Updated node content.")
+    metadata: Optional[Dict] = Field(default=None, description="Updated metadata.")
+    node_type: Optional[str] = Field(default=None, description="Updated node type.")
+
+
+class EdgeInfo(BaseModel):
+    """Edge information in node relationships."""
+
+    edge_id: str
+    source_id: str
+    target_id: str
+    relationship: str
+    weight: float = Field(..., ge=0.0, le=1.0)
+
+
+class NodeResponse(BaseModel):
+    """Complete node response with relationships."""
+
+    node_id: str
+    content: str
+    metadata: Dict = Field(default_factory=dict)
+    relationships: List[EdgeInfo] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+
+
+class VectorSearchRequest(BaseModel):
+    """Request for vector-only search."""
+
+    query_text: str = Field(..., min_length=3, description="Search query text.")
+    top_k: int = Field(default=settings.DEFAULT_TOP_K, ge=1, le=settings.MAX_TOP_K, description="Number of results.")
+
+
+class GraphTraversalRequest(BaseModel):
+    """Request for graph traversal search."""
+
+    start_id: str = Field(..., description="Starting node ID for traversal.")
+    depth: int = Field(default=3, ge=1, le=10, description="Maximum traversal depth.")
+    max_nodes: int = Field(default=100, ge=1, le=1000, description="Maximum nodes to return.")
+
+
+class HybridSearchRequest(BaseModel):
+    """Request for hybrid search with explicit weights."""
+
+    query_text: str = Field(..., min_length=3, description="Search query text.")
+    vector_weight: float = Field(default=0.6, ge=0.0, le=1.0, description="Weight for vector similarity.")
+    graph_weight: float = Field(default=0.4, ge=0.0, le=1.0, description="Weight for graph proximity.")
+    top_k: int = Field(default=settings.DEFAULT_TOP_K, ge=1, le=settings.MAX_TOP_K, description="Number of results.")
+
+
+class TraversalNode(BaseModel):
+    """Node in graph traversal result."""
+
+    node_id: str
+    content: str
+    distance: int = Field(..., ge=0, description="Distance from start node.")
+    path: List[str] = Field(default_factory=list, description="Path from start to this node.")
+    metadata: Dict = Field(default_factory=dict)
+
+
+class GraphTraversalResponse(BaseModel):
+    """Response from graph traversal search."""
+
+    start_id: str
+    depth: int
+    nodes: List[TraversalNode]
+
+
+class HybridSearchResult(BaseModel):
+    """Result from hybrid search with score breakdown."""
+
+    node_id: str
+    content: str
+    score: float = Field(..., ge=0.0, le=1.0)
+    vector_score: float = Field(..., ge=0.0, le=1.0)
+    graph_score: float = Field(..., ge=0.0, le=1.0)
+    metadata: Dict = Field(default_factory=dict)
 
