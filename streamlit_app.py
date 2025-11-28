@@ -1,7 +1,8 @@
-"""Streamlit app for GraphMind - Static Frontend Display."""
+"""Streamlit app for GraphMind - Simple Frontend with USP Button."""
 
 import streamlit as st
 from pathlib import Path
+import sys
 
 # Page config
 st.set_page_config(
@@ -11,63 +12,146 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Get the frontend HTML file path
+# Get paths
 project_root = Path(__file__).parent
-frontend_path = project_root / "frontend" / "index.html"
+usp_path = project_root / "USP1_vector_graph_search" / "parse_zip" / "streamlit_ui.py"
 
-# Sidebar with USP button
+# Sidebar
 with st.sidebar:
     st.title("🧠 GraphMind")
     st.markdown("**Hybrid Vector + Graph Database**")
     st.markdown("---")
+    
+    # USP Button
     if st.button("🚀 USP", type="primary", use_container_width=True):
         st.session_state.show_usp = True
+        st.rerun()
+    
+    # Upload Button - Show popup
+    if st.button("📤 Upload", use_container_width=True):
+        st.session_state.show_download_popup = True
+        st.rerun()
 
-# Check if frontend exists
-if frontend_path.exists():
-    # Read the HTML content
-    with open(frontend_path, 'r', encoding='utf-8') as f:
-        html_content = f.read()
+# Show download popup if upload button was clicked
+if st.session_state.get("show_download_popup", False):
+    st.error("""
+    ⚠️ **Backend Required for Upload**
     
-    # Read CSS and JS
-    css_path = project_root / "frontend" / "style.css"
-    js_path = project_root / "frontend" / "app.js"
+    To use the upload feature, please download the full repository:
     
-    css_content = ""
-    if css_path.exists():
-        with open(css_path, 'r', encoding='utf-8') as f:
-            css_content = f.read()
+    1. **Clone the repository:**
+       ```bash
+       git clone <your-repo-url>
+       cd GraphMind-scaler
+       ```
     
-    js_content = ""
-    if js_path.exists():
-        with open(js_path, 'r', encoding='utf-8') as f:
-            js_content = f.read()
+    2. **Install dependencies:**
+       ```bash
+       pip install -r requirements.txt
+       ```
     
-    # Inject CSS into HTML
-    if css_content:
-        html_content = html_content.replace(
-            '<link rel="stylesheet" href="/static/style.css">',
-            f'<style>{css_content}</style>'
-        )
+    3. **Start the backend:**
+       ```bash
+       uvicorn backend.main:app --reload
+       ```
     
-    # Inject JS into HTML
-    if js_content:
-        html_content = html_content.replace(
-            '<script src="/static/app.js"></script>',
-            f'<script>{js_content}</script>'
-        )
+    4. **Then use the full application with all features!**
     
-    # Fix any static paths
-    html_content = html_content.replace('/static/', '')
-    
-    # Display the HTML
-    st.components.v1.html(html_content, height=900, scrolling=True)
-    
-else:
-    st.error("❌ Frontend files not found!")
-    st.info("""
-    **Expected structure:**
-    - `frontend/index.html`
-    - `frontend/style.css`  
-    - `frontend/app.js`
+    See README.md for complete installation instructions.
     """)
+    
+    if st.button("Got it", type="primary"):
+        st.session_state.show_download_popup = False
+        st.rerun()
+
+# Show USP interface
+if st.session_state.get("show_usp", False):
+    if usp_path.exists():
+        st.info("""
+        **🚀 USP Interface**
+        
+        To run the full USP interface with backend:
+        
+        1. **Download the repository** (if you haven't already)
+        2. **Install dependencies:** `pip install -r requirements.txt`
+        3. **Start backend:** `uvicorn backend.main:app --reload` (in one terminal)
+        4. **Run USP:** `streamlit run USP1_vector_graph_search/parse_zip/streamlit_ui.py` (in another terminal)
+        
+        The USP interface requires the backend API to be running on `http://localhost:8000`
+        """)
+        
+        st.markdown("---")
+        st.markdown("### USP Features Preview")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            **🔍 Search Tab:**
+            - Vector Search (Semantic Similarity)
+            - Graph Traversal (Relationship Reasoning)
+            - Hybrid Search (Best of Both!)
+            - Adjustable weights
+            """)
+        
+        with col2:
+            st.markdown("""
+            **📊 Other Tabs:**
+            - Comparison: Side-by-side method comparison
+            - Statistics: System health metrics
+            - Add Data: Create nodes and relationships
+            """)
+        
+        st.code("""
+# To run USP locally:
+# Terminal 1:
+uvicorn backend.main:app --reload
+
+# Terminal 2:
+streamlit run USP1_vector_graph_search/parse_zip/streamlit_ui.py
+        """, language="bash")
+        
+    else:
+        st.error("❌ USP file not found!")
+        st.info(f"Expected path: `{usp_path}`")
+else:
+    # Default landing page
+    st.header("Welcome to GraphMind 🧠")
+    st.markdown("**Hybrid Vector + Graph Database**")
+    
+    st.info("""
+    👆 **Click the USP button in the sidebar** to learn about the Vector + Graph Hybrid Database interface.
+    
+    **Note:** For full functionality including uploads and the USP interface, please download the repository and follow the installation instructions in README.md
+    """)
+    
+    st.markdown("---")
+    st.markdown("### Quick Links")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        **📚 Features:**
+        - Vector Search (Semantic Similarity)
+        - Graph Traversal (Relationship Reasoning)
+        - Hybrid Search (Best of Both!)
+        - Interactive UI
+        """)
+    
+    with col2:
+        st.markdown("""
+        **🚀 Get Started:**
+        1. Click **USP** button for info
+        2. Download repo for full features
+        3. See README.md for setup
+        """)
+
+# Footer
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #888;'>"
+    "🧠 GraphMind - Hybrid Vector + Graph Database | Built with Streamlit"
+    "</div>",
+    unsafe_allow_html=True
+)
