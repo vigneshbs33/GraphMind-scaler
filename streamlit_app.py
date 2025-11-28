@@ -14,10 +14,41 @@ import networkx as nx
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from backend.config import settings
-from backend.storage import GraphMindStorage
-from backend.ingestion import IngestionPipeline
-from backend.llm_processor import get_llm_processor
+# Verify backend is available
+backend_path = project_root / "backend"
+if not backend_path.exists():
+    st.error("""
+    ❌ **Backend not found!**
+    
+    The `backend` directory is missing. Please ensure you have cloned/downloaded the full repository.
+    
+    **For deployment:** The entire repository should be available. If deploying to Streamlit Cloud, 
+    make sure the repository contains the `backend` folder.
+    
+    **Repository structure should include:**
+    - `streamlit_app.py` (this file)
+    - `backend/` (backend modules)
+    - `requirements.txt` (dependencies)
+    """)
+    st.stop()
+
+try:
+    from backend.config import settings
+    from backend.storage import GraphMindStorage
+    from backend.ingestion import IngestionPipeline
+    from backend.llm_processor import get_llm_processor
+except ImportError as e:
+    st.error(f"""
+    ❌ **Failed to import backend modules!**
+    
+    Error: {str(e)}
+    
+    Please ensure:
+    1. The full repository is downloaded/cloned
+    2. All dependencies are installed: `pip install -r requirements.txt`
+    3. The `backend` directory structure is intact
+    """)
+    st.stop()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
