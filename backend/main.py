@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
@@ -16,7 +17,7 @@ from .config import settings
 from .evaluation import SearchEvaluator
 from .exceptions import GraphMindError, ValidationError, NotFoundError, StorageError, LLMError
 from .ingestion import IngestionPipeline, parse_metadata
-from .llm_processor import get_llm_processor
+from .llm_processor import LLMProcessor, get_llm_processor
 from .middleware import LoggingMiddleware, SecurityHeadersMiddleware
 from .models import (
     ComparisonRequest,
@@ -25,6 +26,7 @@ from .models import (
     EdgeInfo,
     GraphTraversalRequest,
     GraphTraversalResponse,
+    HybridExplainRequest,
     HybridSearchRequest,
     HybridSearchResult,
     NodeCreate,
@@ -57,6 +59,11 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+# Mount static files for frontend assets
+frontend_dir = settings.BASE_DIR / "frontend"
+if frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
 # Exception handlers
 @app.exception_handler(GraphMindError)
@@ -174,12 +181,14 @@ async def stats(storage: GraphMindStorage = Depends(get_storage)) -> Dict[str, f
     return storage.get_stats()
 
 
-@app.post("/nodes", response_model=SearchResult)
+@app.post("/nodes", status_code=201)
 async def create_node(
     payload: NodeCreate, 
     storage: GraphMindStorage = Depends(get_storage)
-) -> SearchResult:
+) -> Dict[str, Any]:
     """Create a new node in the knowledge graph."""
+    from datetime import datetime
+    
     try:
         # Validate graph size limits
         current_nodes = storage.graph.number_of_nodes()
@@ -189,21 +198,58 @@ async def create_node(
                 {"current_nodes": current_nodes, "limit": settings.MAX_GRAPH_NODES}
             )
         
-        node_id = storage.add_node(payload.id, payload.content, payload.metadata)
+        # Get embedding if provided in metadata
+        embedding = payload.metadata.pop("embedding", None) if isinstance(payload.metadata, dict) else None
+        
+        node_id = storage.add_node(payload.id, payload.content, payload.metadata or {}, embedding)
+        
+        # Get created node to return full data
+        node_data = storage.get_node(node_id)
+        
         logger.info("Node created: %s", node_id)
         
-        return SearchResult(
-            node_id=node_id,
-            content=payload.content,
-            score=1.0,
-            metadata=payload.metadata,
-            reasoning=payload.node_type or "",
-        )
+        return {
+            "status": "created",
+            "id": node_id,
+            "text": payload.content,
+            "metadata": payload.metadata or {},
+            "embedding": node_data.get("embedding"),
+            "created_at": node_data.get("created_at", datetime.utcnow().isoformat())
+        }
     except ValueError as e:
         raise ValidationError(str(e))
     except Exception as e:
         logger.error("Failed to create node: %s", str(e), exc_info=True)
         raise StorageError(f"Failed to create node: {str(e)}")
+
+
+@app.get("/nodes/{node_id}/summary")
+async def get_node_summary(
+    node_id: str,
+    storage: GraphMindStorage = Depends(get_storage),
+    llm: LLMProcessor = Depends(lambda: app.state.llm),
+) -> Dict[str, Any]:
+    """Get LLM-generated summary for a node."""
+    try:
+        node_data = storage.get_node(node_id)
+        
+        # Generate summary using LLM
+        formatted_result = [{
+            "node_id": node_data["node_id"],
+            "content": node_data["content"],
+            "score": 1.0,
+            "metadata": node_data.get("metadata", {})
+        }]
+        
+        query = f"Provide a brief summary of this node: {node_data['node_id']}"
+        summary = await llm.refine_results(formatted_result, query)
+        
+        return {"summary": summary, "node_id": node_id}
+    except NotFoundError:
+        raise
+    except Exception as e:
+        logger.error("Failed to generate node summary: %s", str(e), exc_info=True)
+        raise StorageError(f"Failed to generate node summary: {str(e)}")
 
 
 @app.get("/nodes/{node_id}", response_model=NodeResponse)
@@ -216,22 +262,35 @@ async def get_node(
         node_data = storage.get_node(node_id)
         
         # Convert relationships to EdgeInfo models
+        # Clamp weights to [0, 1] to handle floating point precision issues
         relationships = [
             EdgeInfo(
                 edge_id=rel["edge_id"],
                 source_id=rel["source_id"],
                 target_id=rel["target_id"],
                 relationship=rel["relationship"],
-                weight=rel["weight"],
+                weight=min(1.0, max(0.0, float(rel.get("weight", 1.0)))),
             )
             for rel in node_data["relationships"]
         ]
+        
+        from datetime import datetime
+        
+        # Parse created_at if it's a string
+        created_at = node_data.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            except:
+                created_at = None
         
         return NodeResponse(
             node_id=node_data["node_id"],
             content=node_data["content"],
             metadata=node_data["metadata"],
             relationships=relationships,
+            embedding=node_data.get("embedding"),
+            created_at=created_at,
         )
     except NotFoundError:
         raise
@@ -252,17 +311,19 @@ async def update_node(
             node_id,
             content=payload.content,
             metadata=payload.metadata,
-            node_type=payload.node_type
+            node_type=payload.node_type,
+            regen_embedding=payload.regen_embedding
         )
         
         # Convert relationships to EdgeInfo models
+        # Clamp weights to [0, 1] to handle floating point precision issues
         relationships = [
             EdgeInfo(
                 edge_id=rel["edge_id"],
                 source_id=rel["source_id"],
                 target_id=rel["target_id"],
                 relationship=rel["relationship"],
-                weight=rel["weight"],
+                weight=min(1.0, max(0.0, float(rel.get("weight", 1.0)))),
             )
             for rel in updated_data["relationships"]
         ]
@@ -342,23 +403,71 @@ async def get_edge_by_id(
         raise StorageError(f"Failed to get edge: {str(e)}")
 
 
-@app.get("/edges")
-async def get_edge_by_nodes(
-    source_id: str,
-    target_id: str,
+@app.delete("/edges/{edge_id}")
+async def delete_edge(
+    edge_id: str,
     storage: GraphMindStorage = Depends(get_storage)
 ) -> Dict[str, Any]:
-    """Get edge details by source_id and target_id."""
+    """Delete an edge by edge_id."""
     try:
-        edge_data = storage.get_edge("", source_id=source_id, target_id=target_id)
-        return edge_data
+        edge_data = storage.get_edge(edge_id)
+        source_id = edge_data["source_id"]
+        target_id = edge_data["target_id"]
+        
+        if not storage.graph.has_edge(source_id, target_id):
+            raise NotFoundError(f"Edge {edge_id} not found")
+        
+        storage.graph.remove_edge(source_id, target_id)
+        logger.info("Edge deleted: %s -> %s", source_id, target_id)
+        
+        return {
+            "status": "deleted",
+            "edge_id": edge_id,
+            "source": source_id,
+            "target": target_id
+        }
     except NotFoundError:
         raise
     except ValidationError:
         raise
     except Exception as e:
-        logger.error("Failed to get edge: %s", str(e), exc_info=True)
-        raise StorageError(f"Failed to get edge: {str(e)}")
+        logger.error("Failed to delete edge: %s", str(e), exc_info=True)
+        raise StorageError(f"Failed to delete edge: {str(e)}")
+
+
+@app.get("/edges")
+async def get_edges(
+    source_id: Optional[str] = None,
+    target_id: Optional[str] = None,
+    storage: GraphMindStorage = Depends(get_storage)
+) -> Dict[str, Any]:
+    """Get edge(s) - list all edges if no params, or get specific edge by source_id and target_id."""
+    try:
+        # If both source_id and target_id provided, get specific edge
+        if source_id and target_id:
+            edge_data = storage.get_edge("", source_id=source_id, target_id=target_id)
+            return edge_data
+        
+        # Otherwise, list all edges
+        all_edges = []
+        for src, dst, attrs in storage.graph.edges(data=True):
+            all_edges.append({
+                "edge_id": f"{src}-{dst}",
+                "source_id": str(src),
+                "target_id": str(dst),
+                "relationship": attrs.get("relationship", ""),
+                "weight": attrs.get("weight", 1.0),
+                "metadata": {k: v for k, v in attrs.items() if k not in ("relationship", "weight")},
+            })
+        
+        return {"edges": all_edges, "count": len(all_edges)}
+    except NotFoundError:
+        raise
+    except ValidationError:
+        raise
+    except Exception as e:
+        logger.error("Failed to get edges: %s", str(e), exc_info=True)
+        raise StorageError(f"Failed to get edges: {str(e)}")
 
 
 @app.get("/graph")
@@ -502,20 +611,28 @@ async def vector_search(
         
         logger.info("Vector search: query=%s, top_k=%d", payload.query_text[:50], payload.top_k)
         
-        raw = storage.vector_search(payload.query_text, payload.top_k)
+        raw = storage.vector_search(
+            payload.query_text, 
+            payload.top_k,
+            query_embedding=payload.query_embedding,
+            metadata_filter=payload.filter
+        )
         
         results = [
-            SearchResult(
-                node_id=item["node_id"],
-                content=item.get("content", ""),
-                score=item.get("score", 0.0),
-                metadata=item.get("metadata", {}),
-                reasoning="",
-            )
+            {
+                "id": item["node_id"],
+                "title": item.get("metadata", {}).get("title", item["node_id"]),
+                "vector_score": item.get("score", 0.0),
+                "content": item.get("content", ""),
+                "metadata": item.get("metadata", {}),
+            }
             for item in raw
         ]
         
-        return {"results": results, "query": payload.query_text}
+        return {
+            "query_text": payload.query_text,
+            "results": results
+        }
     except Exception as e:
         logger.error("Vector search failed: %s", str(e), exc_info=True)
         raise StorageError(f"Vector search failed: {str(e)}")
@@ -526,6 +643,7 @@ async def graph_traversal_search(
     start_id: str,
     depth: int = 3,
     max_nodes: int = 100,
+    relationship_type: Optional[str] = None,
     storage: GraphMindStorage = Depends(get_storage),
 ) -> GraphTraversalResponse:
     """Graph traversal search from a starting node."""
@@ -537,7 +655,7 @@ async def graph_traversal_search(
         
         logger.info("Graph traversal: start_id=%s, depth=%d, max_nodes=%d", start_id, depth, max_nodes)
         
-        raw = storage.graph_traversal(start_id, depth, max_nodes)
+        raw = storage.graph_traversal(start_id, depth, max_nodes, relationship_type=relationship_type)
         
         nodes = [
             TraversalNode(
@@ -560,6 +678,32 @@ async def graph_traversal_search(
     except Exception as e:
         logger.error("Graph traversal failed: %s", str(e), exc_info=True)
         raise StorageError(f"Graph traversal failed: {str(e)}")
+
+
+@app.post("/search/hybrid/explain")
+async def hybrid_search_explain(
+    payload: HybridExplainRequest,
+    llm: LLMProcessor = Depends(lambda: app.state.llm),
+) -> Dict[str, Any]:
+    """Generate LLM answer from hybrid search results."""
+    try:
+        # Convert results to format expected by refine_results
+        formatted_results = [
+            {
+                "node_id": r.get("node_id", ""),
+                "content": r.get("content", ""),
+                "score": r.get("score", r.get("vector_score", r.get("graph_score", 0.0))),
+                "metadata": r.get("metadata", {})
+            }
+            for r in payload.results
+        ]
+        
+        answer = await llm.refine_results(formatted_results, payload.query)
+        
+        return {"answer": answer, "query": payload.query}
+    except Exception as e:
+        logger.error("Failed to generate explanation: %s", str(e), exc_info=True)
+        raise StorageError(f"Failed to generate explanation: {str(e)}")
 
 
 @app.post("/search/hybrid")
@@ -591,12 +735,34 @@ async def hybrid_search(
             payload.top_k,
         )
         
-        # Get hybrid results
-        hybrid_raw = storage.hybrid_search(payload.query_text, payload.top_k, alpha)
+        # Get hybrid results (already uses parallel execution internally)
+        hybrid_raw = storage.hybrid_search(
+            payload.query_text, 
+            payload.top_k, 
+            alpha,
+            query_embedding=payload.query_embedding
+        )
         
-        # Get individual scores for breakdown
-        vector_raw = storage.vector_search(payload.query_text, payload.top_k * 2)
-        graph_raw = storage.graph_search(payload.query_text, payload.top_k * 2)
+        # Get individual scores for breakdown in parallel
+        import asyncio
+        import concurrent.futures
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            vector_future = executor.submit(
+                storage.vector_search, 
+                payload.query_text, 
+                payload.top_k * 2,
+                payload.query_embedding,
+                None
+            )
+            graph_future = executor.submit(
+                storage.graph_search, 
+                payload.query_text, 
+                payload.top_k * 2
+            )
+            
+            vector_raw = vector_future.result()
+            graph_raw = graph_future.result()
         
         # Create score maps
         vector_scores = {item["node_id"]: item["score"] for item in vector_raw}

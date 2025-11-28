@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
 
 import chromadb
 import networkx as nx
@@ -42,16 +44,27 @@ class GraphMindStorage:
         self.graph = nx.DiGraph()
         self.vector_to_graph_map: Dict[str, str] = {}
         self.merge_runs = 0
+        
+        # Caching layer
+        self.query_cache: OrderedDict[str, Tuple[List[Dict], float]] = OrderedDict()  # query -> (results, timestamp)
+        self.embedding_cache: Dict[str, Tuple[List[float], float]] = {}  # text -> (embedding, timestamp)
+        self.cache_max_size = 100  # Maximum number of cached queries
+        self.cache_ttl = 300  # 5 minutes TTL
+        
         logger.info(
             "Storage initialized: %s vectors present",
             self.collection.count(),
         )
 
-    def add_node(self, node_id: Optional[str], content: str, metadata: Dict) -> str:
+    def add_node(self, node_id: Optional[str], content: str, metadata: Dict, embedding: Optional[List[float]] = None) -> str:
         """Insert a node across vector+graph stores."""
+        from datetime import datetime
+        
         node_id = node_id or str(uuid.uuid4())
-        embedding = self.embedding_model.encode(content).tolist()
+        if embedding is None:
+            embedding = self.embedding_model.encode(content).tolist()
         safe_meta = metadata or {}
+        safe_meta["created_at"] = datetime.utcnow().isoformat()
         self.collection.add(
             ids=[node_id],
             embeddings=[embedding],
@@ -75,14 +88,76 @@ class GraphMindStorage:
         )
         logger.debug("Edge %s -> %s (%s)", source_id, target_id, relationship)
 
-    def vector_search(self, query: str, top_k: int) -> List[Dict]:
-        """Return top_k vector similarities."""
-        if not query:
+    def _get_cached_embedding(self, text: str) -> Optional[List[float]]:
+        """Get cached embedding if available and not expired."""
+        if text in self.embedding_cache:
+            embedding, timestamp = self.embedding_cache[text]
+            if time.time() - timestamp < self.cache_ttl:
+                return embedding
+            else:
+                del self.embedding_cache[text]
+        return None
+    
+    def _cache_embedding(self, text: str, embedding: List[float]) -> None:
+        """Cache an embedding with timestamp."""
+        # Limit cache size
+        if len(self.embedding_cache) >= self.cache_max_size:
+            # Remove oldest entry
+            oldest_key = min(self.embedding_cache.keys(), key=lambda k: self.embedding_cache[k][1])
+            del self.embedding_cache[oldest_key]
+        self.embedding_cache[text] = (embedding, time.time())
+    
+    def _get_cached_query(self, cache_key: str) -> Optional[List[Dict]]:
+        """Get cached query results if available and not expired."""
+        if cache_key in self.query_cache:
+            results, timestamp = self.query_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                # Move to end (most recently used)
+                self.query_cache.move_to_end(cache_key)
+                return results
+            else:
+                del self.query_cache[cache_key]
+        return None
+    
+    def _cache_query(self, cache_key: str, results: List[Dict]) -> None:
+        """Cache query results with timestamp."""
+        # Limit cache size using LRU eviction
+        if len(self.query_cache) >= self.cache_max_size:
+            # Remove oldest entry (first in OrderedDict)
+            self.query_cache.popitem(last=False)
+        self.query_cache[cache_key] = (results, time.time())
+    
+    def vector_search(self, query: str, top_k: int, query_embedding: Optional[List[float]] = None, metadata_filter: Optional[Dict] = None) -> List[Dict]:
+        """Return top_k vector similarities with optional metadata filtering and caching."""
+        if not query and not query_embedding:
             return []
-        embedding = self.embedding_model.encode(query).tolist()
+        
+        # Check cache (only if no metadata filter and using query text)
+        if query and not metadata_filter and not query_embedding:
+            cache_key = f"vector:{query}:{top_k}"
+            cached = self._get_cached_query(cache_key)
+            if cached is not None:
+                logger.debug("Cache hit for vector search: %s", query[:50])
+                return cached
+        
+        if query_embedding is None:
+            # Check embedding cache
+            embedding = self._get_cached_embedding(query)
+            if embedding is None:
+                embedding = self.embedding_model.encode(query).tolist()
+                self._cache_embedding(query, embedding)
+        else:
+            embedding = query_embedding
+        
+        # Build where clause for metadata filtering
+        where = None
+        if metadata_filter:
+            where = metadata_filter
+        
         results = self.collection.query(
             query_embeddings=[embedding],
-            n_results=top_k,
+            n_results=min(top_k, self.collection.count()) if self.collection.count() > 0 else top_k,
+            where=where,
             include=["documents", "metadatas", "distances"],
         )
         ids = results.get("ids", [[]])[0]
@@ -108,10 +183,23 @@ class GraphMindStorage:
                     "metadata": metadatas[idx] if idx < len(metadatas) else {},
                 }
             )
+        
+        # Cache results if applicable
+        if query and not metadata_filter and not query_embedding:
+            cache_key = f"vector:{query}:{top_k}"
+            self._cache_query(cache_key, payload)
+        
         return payload
 
     def graph_search(self, query: str, top_k: int) -> List[Dict]:
-        """Traverse neighbors starting from vector seed."""
+        """Traverse neighbors starting from vector seed with caching."""
+        # Check cache
+        cache_key = f"graph:{query}:{top_k}"
+        cached = self._get_cached_query(cache_key)
+        if cached is not None:
+            logger.debug("Cache hit for graph search: %s", query[:50])
+            return cached
+        
         seed_results = self.vector_search(query, top_k=1)
         if not seed_results:
             return []
@@ -129,21 +217,34 @@ class GraphMindStorage:
             for node_id, dist in paths.items()
         ]
         scored.sort(key=lambda item: item[1], reverse=True)
-        return [
+        results = [
             {"node_id": node_id, "content": content, "score": score, "metadata": meta}
             for node_id, score, content, meta in scored[:top_k]
         ]
+        
+        # Cache results
+        self._cache_query(cache_key, results)
+        return results
 
     def hybrid_search(
         self, 
         query: str, 
         top_k: int, 
         alpha: float,
+        query_embedding: Optional[List[float]] = None,
         relationship_weights: Optional[Dict[str, float]] = None
     ) -> List[Dict]:
-        """Blend vector and graph scores with optional relationship weighting."""
-        vector_results = self.vector_search(query, top_k * 2)
-        graph_results = self.graph_search(query, top_k * 2)
+        """Blend vector and graph scores with optional relationship weighting using parallel execution."""
+        import concurrent.futures
+        
+        # Run vector and graph searches in parallel using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            vector_future = executor.submit(self.vector_search, query, top_k * 2, query_embedding, None)
+            graph_future = executor.submit(self.graph_search, query, top_k * 2)
+            
+            # Wait for both to complete
+            vector_results = vector_future.result()
+            graph_results = graph_future.result()
         combined: Dict[str, Dict] = {}
         
         # Apply relationship weights to graph scores if provided
@@ -195,7 +296,13 @@ class GraphMindStorage:
                 }
             )
         results.sort(key=lambda item: item["score"], reverse=True)
-        return results[:top_k]
+        final_results = results[:top_k]
+        
+        # Cache hybrid search results
+        cache_key = f"hybrid:{query}:{top_k}:{alpha}"
+        self._cache_query(cache_key, final_results)
+        
+        return final_results
 
     def merge_algorithm(self) -> None:
         """Run PageRank and add semantic similarity edges."""
@@ -232,6 +339,15 @@ class GraphMindStorage:
         
         node_data = self.graph.nodes[node_id]
         
+        # Get embedding from ChromaDB
+        embedding = None
+        try:
+            chroma_result = self.collection.get(ids=[node_id], include=["embeddings"])
+            if chroma_result["embeddings"] and len(chroma_result["embeddings"]) > 0:
+                embedding = chroma_result["embeddings"][0]
+        except Exception as e:
+            logger.warning("Could not retrieve embedding for node %s: %s", node_id, str(e))
+        
         # Get all connected edges (incoming and outgoing)
         incoming_edges = [
             {
@@ -255,14 +371,19 @@ class GraphMindStorage:
             for dst in self.graph.successors(node_id)
         ]
         
-        return {
+        result = {
             "node_id": node_id,
             "content": node_data.get("content", ""),
-            "metadata": {k: v for k, v in node_data.items() if k != "content"},
+            "metadata": {k: v for k, v in node_data.items() if k not in ("content", "embedding")},
             "relationships": incoming_edges + outgoing_edges,
         }
+        
+        if embedding is not None:
+            result["embedding"] = embedding
+        
+        return result
 
-    def update_node(self, node_id: str, content: Optional[str] = None, metadata: Optional[Dict] = None, node_type: Optional[str] = None) -> Dict:
+    def update_node(self, node_id: str, content: Optional[str] = None, metadata: Optional[Dict] = None, node_type: Optional[str] = None, regen_embedding: bool = True) -> Dict:
         """Update node attributes in NetworkX and ChromaDB if content changed."""
         from .exceptions import NotFoundError
         
@@ -277,14 +398,22 @@ class GraphMindStorage:
             node_data["content"] = content
             content_changed = True
             
-            # Regenerate embedding and update ChromaDB
-            embedding = self.embedding_model.encode(content).tolist()
-            self.collection.update(
-                ids=[node_id],
-                embeddings=[embedding],
-                documents=[content],
-            )
-            logger.debug("Updated node content and embedding: %s", node_id)
+            # Regenerate embedding if requested
+            if regen_embedding:
+                embedding = self.embedding_model.encode(content).tolist()
+                self.collection.update(
+                    ids=[node_id],
+                    embeddings=[embedding],
+                    documents=[content],
+                )
+                logger.debug("Updated node content and embedding: %s", node_id)
+            else:
+                # Just update document without changing embedding
+                self.collection.update(
+                    ids=[node_id],
+                    documents=[content],
+                )
+                logger.debug("Updated node content without regenerating embedding: %s", node_id)
         
         # Update node_type if provided
         if node_type is not None:
@@ -345,12 +474,44 @@ class GraphMindStorage:
         # Parse edge_id or use provided source_id and target_id
         if source_id and target_id:
             src, dst = source_id, target_id
-        elif "-" in edge_id:
-            parts = edge_id.split("-", 1)
-            if len(parts) == 2:
-                src, dst = parts
+        elif edge_id:
+            # Edge ID format: source_id-target_id
+            # For UUIDs (36 chars each), the format is: {36 chars}-{36 chars}
+            # UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (exactly 36 chars)
+            # So if edge_id is 73 chars (36 + 1 dash + 36), split at position 36
+            if len(edge_id) == 73 and edge_id[36] == '-':
+                # Two UUIDs separated by a dash
+                src = edge_id[:36]
+                dst = edge_id[37:]
             else:
-                raise ValidationError(f"Invalid edge_id format: {edge_id}")
+                # For non-UUID cases or if format doesn't match, try to find split point
+                # Look for pattern where we have a complete UUID followed by dash and another UUID
+                # UUID has 4 dashes at positions: 8, 13, 18, 23
+                # So after position 23, we have 12 more chars = position 35, then dash at 36
+                # Try splitting at various positions
+                dash_positions = [i for i, c in enumerate(edge_id) if c == '-']
+                if len(dash_positions) >= 5:  # At least 4 for first UUID + 1 separator
+                    # First UUID ends at position 35 (0-indexed), dash at 36
+                    # Check if position 36 is a dash and length suggests two UUIDs
+                    if len(edge_id) >= 37 and edge_id[36] == '-':
+                        src = edge_id[:36]
+                        dst = edge_id[37:]
+                    else:
+                        # Try to find the separator dash (should be after a complete UUID)
+                        # A complete UUID is 36 chars, so look for dash at index 36
+                        # If not found, fall back to splitting on first dash
+                        parts = edge_id.split("-", 1)
+                        if len(parts) == 2:
+                            src, dst = parts
+                        else:
+                            raise ValidationError(f"Invalid edge_id format: {edge_id}")
+                else:
+                    # Not UUIDs or simple format, split on first dash
+                    parts = edge_id.split("-", 1)
+                    if len(parts) == 2:
+                        src, dst = parts
+                    else:
+                        raise ValidationError(f"Invalid edge_id format: {edge_id}")
         else:
             raise ValidationError("Either edge_id or both source_id and target_id must be provided")
         
@@ -368,29 +529,65 @@ class GraphMindStorage:
             "metadata": {k: v for k, v in edge_data.items() if k not in ("relationship", "weight")},
         }
 
-    def graph_traversal(self, start_id: str, depth: int = 3, max_nodes: int = 100) -> List[Dict]:
-        """Traverse graph from start node up to specified depth."""
+    def graph_traversal(self, start_id: str, depth: int = 3, max_nodes: int = 100, relationship_type: Optional[str] = None) -> List[Dict]:
+        """Traverse graph from start node up to specified depth with optional relationship filtering."""
         from .exceptions import NotFoundError
         
         if start_id not in self.graph:
             raise NotFoundError(f"Start node {start_id} not found")
         
-        # Use BFS to find all reachable nodes
-        paths = nx.single_source_shortest_path_length(self.graph, start_id, cutoff=depth)
+        # Create filtered graph if relationship type is specified
+        if relationship_type:
+            filtered_graph = nx.DiGraph()
+            for u, v, data in self.graph.edges(data=True):
+                if data.get("relationship") == relationship_type:
+                    filtered_graph.add_edge(u, v, **data)
+            # Add all nodes
+            for node in self.graph.nodes():
+                filtered_graph.add_node(node, **self.graph.nodes[node])
+            traversal_graph = filtered_graph
+        else:
+            traversal_graph = self.graph
+        
+        # Use BFS to find all reachable nodes (handles cycles by visited set)
+        visited = set()
+        queue = [(start_id, 0, [start_id])]
+        paths_dict = {}
+        
+        while queue and len(visited) < max_nodes:
+            node_id, current_depth, path = queue.pop(0)
+            
+            if node_id in visited or current_depth > depth:
+                continue
+                
+            visited.add(node_id)
+            paths_dict[node_id] = (current_depth, path)
+            
+            if current_depth < depth:
+                for neighbor in traversal_graph.successors(node_id):
+                    if neighbor not in visited:
+                        queue.append((neighbor, current_depth + 1, path + [neighbor]))
         
         # Build traversal results with paths
         results = []
-        for node_id, distance in paths.items():
+        for node_id, (distance, path) in paths_dict.items():
             if len(results) >= max_nodes:
                 break
             
-            # Get shortest path
-            try:
-                path = nx.shortest_path(self.graph, start_id, node_id)
-            except nx.NetworkXNoPath:
-                path = [start_id, node_id]
-            
             node_data = self.graph.nodes[node_id]
+            
+            # Get edge info for path
+            edge_info = []
+            if len(path) > 1:
+                for i in range(len(path) - 1):
+                    src, dst = path[i], path[i + 1]
+                    if self.graph.has_edge(src, dst):
+                        edge_data = self.graph.edges[src, dst]
+                        edge_info.append({
+                            "edge": edge_data.get("relationship", ""),
+                            "weight": edge_data.get("weight", 1.0)
+                        })
+            
             results.append({
                 "node_id": node_id,
                 "content": node_data.get("content", ""),

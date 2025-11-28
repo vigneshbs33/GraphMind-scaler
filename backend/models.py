@@ -125,6 +125,7 @@ class NodeUpdate(BaseModel):
     content: Optional[str] = Field(default=None, max_length=10_000, description="Updated node content.")
     metadata: Optional[Dict] = Field(default=None, description="Updated metadata.")
     node_type: Optional[str] = Field(default=None, description="Updated node type.")
+    regen_embedding: bool = Field(default=True, description="Regenerate embedding when content changes.")
 
 
 class EdgeInfo(BaseModel):
@@ -145,13 +146,16 @@ class NodeResponse(BaseModel):
     metadata: Dict = Field(default_factory=dict)
     relationships: List[EdgeInfo] = Field(default_factory=list)
     created_at: Optional[datetime] = None
+    embedding: Optional[List[float]] = Field(default=None, description="Node embedding vector.")
 
 
 class VectorSearchRequest(BaseModel):
     """Request for vector-only search."""
 
     query_text: str = Field(..., min_length=3, description="Search query text.")
+    query_embedding: Optional[List[float]] = Field(default=None, description="Optional pre-computed query embedding.")
     top_k: int = Field(default=settings.DEFAULT_TOP_K, ge=1, le=settings.MAX_TOP_K, description="Number of results.")
+    filter: Optional[Dict] = Field(default=None, description="Metadata filter for results.")
 
 
 class GraphTraversalRequest(BaseModel):
@@ -160,12 +164,14 @@ class GraphTraversalRequest(BaseModel):
     start_id: str = Field(..., description="Starting node ID for traversal.")
     depth: int = Field(default=3, ge=1, le=10, description="Maximum traversal depth.")
     max_nodes: int = Field(default=100, ge=1, le=1000, description="Maximum nodes to return.")
+    relationship_type: Optional[str] = Field(default=None, description="Filter edges by relationship type.")
 
 
 class HybridSearchRequest(BaseModel):
     """Request for hybrid search with explicit weights."""
 
     query_text: str = Field(..., min_length=3, description="Search query text.")
+    query_embedding: Optional[List[float]] = Field(default=None, description="Optional pre-computed query embedding.")
     vector_weight: float = Field(default=0.6, ge=0.0, le=1.0, description="Weight for vector similarity.")
     graph_weight: float = Field(default=0.4, ge=0.0, le=1.0, description="Weight for graph proximity.")
     top_k: int = Field(default=settings.DEFAULT_TOP_K, ge=1, le=settings.MAX_TOP_K, description="Number of results.")
@@ -194,8 +200,15 @@ class HybridSearchResult(BaseModel):
 
     node_id: str
     content: str
-    score: float = Field(..., ge=0.0, le=1.0)
-    vector_score: float = Field(..., ge=0.0, le=1.0)
-    graph_score: float = Field(..., ge=0.0, le=1.0)
+    score: float = Field(..., ge=0.0, le=1.0, description="Final combined score.")
+    vector_score: float = Field(..., ge=0.0, le=1.0, description="Vector similarity score.")
+    graph_score: float = Field(..., ge=0.0, le=1.0, description="Graph proximity score.")
     metadata: Dict = Field(default_factory=dict)
+    info: Optional[Dict] = Field(default=None, description="Additional info like hop distance, edge details.")
 
+
+class HybridExplainRequest(BaseModel):
+    """Request for LLM explanation from search results."""
+
+    query: str = Field(..., min_length=1, description="Original search query.")
+    results: List[Dict[str, Any]] = Field(..., description="Search results to explain.")
