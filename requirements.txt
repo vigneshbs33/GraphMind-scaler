@@ -15,10 +15,10 @@ tokenizers==0.15.2
 
 # File Processing
 PyPDF2==3.0.1
-Pillow==10.1.0
+Pillow>=10.4.0,<11.0.0
 xmltodict==0.13.0
 aiofiles==23.2.1
-python-magic-bin==0.4.14
+# python-magic-bin==0.4.14  # Windows-only, not needed for Linux deployment
 
 # Testing
 pytest==7.4.3
