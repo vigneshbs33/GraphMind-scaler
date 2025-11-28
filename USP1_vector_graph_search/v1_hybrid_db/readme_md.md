@@ -73,7 +73,7 @@ Modern AI systems need both **semantic understanding** AND **relationship reason
 
 ```bash
 # 1. Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/vigneshbs33/GraphMind-scaler
 cd hybrid-vector-graph-db
 
 # 2. Create virtual environment

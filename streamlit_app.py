@@ -41,7 +41,7 @@ if st.session_state.get("show_download_popup", False):
     
     1. **Clone the repository:**
        ```bash
-       git clone <your-repo-url>
+       git clone https://github.com/vigneshbs33/GraphMind-scaler
        cd GraphMind-scaler
        ```
     

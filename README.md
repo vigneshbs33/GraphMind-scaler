@@ -22,7 +22,7 @@ Built for the Devfolio Problem Statement: "Vector + Graph Native Database for Ef
 ### Step 1: Clone Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/vigneshbs33/GraphMind-scaler
 cd GraphMind-scaler
 ```
 
