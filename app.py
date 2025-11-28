@@ -134,6 +134,97 @@ if page == "🔍 Search":
         else:
             st.warning("Please enter a query")
 
+    st.divider()
+    st.subheader("🧠 Node Intelligence")
+    node_col1, node_col2 = st.columns([2, 1])
+    with node_col1:
+        node_lookup_id = st.text_input("Node ID", key="node_lookup_id", placeholder="e.g., doc1")
+    with node_col2:
+        lookup_button = st.button("📌 View Node Details")
+    
+    if lookup_button and node_lookup_id:
+        try:
+            storage = st.session_state.storage
+            node_data = storage.get_node(node_lookup_id.strip())
+            
+            st.markdown(f"### Node `{node_data['node_id']}`")
+            st.markdown("**Content**")
+            st.info(node_data.get("content", "No content available"))
+            
+            st.markdown("**Metadata**")
+            st.json(node_data.get("metadata", {}))
+            
+            relationships = node_data.get("relationships", [])
+            st.markdown(f"**Relationships ({len(relationships)})**")
+            if relationships:
+                rel_df = pd.DataFrame(relationships)
+                st.dataframe(rel_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("No relationships found.")
+            
+            if st.session_state.llm:
+                try:
+                    with st.spinner("Generating Gemini summary..."):
+                        formatted_result = [{
+                            "node_id": node_data["node_id"],
+                            "content": node_data.get("content", ""),
+                            "score": 1.0,
+                            "metadata": node_data.get("metadata", {})
+                        }]
+                        summary_prompt = f"Provide a concise summary for node {node_data['node_id']}."
+                        summary = asyncio.run(
+                            st.session_state.llm.refine_results(formatted_result, summary_prompt)
+                        )
+                        st.markdown("#### 🤖 Gemini Summary")
+                        st.write(summary)
+                except Exception as e:
+                    st.warning(f"Could not generate summary: {str(e)}")
+        except Exception as e:
+            st.error(f"Failed to load node: {str(e)}")
+    elif lookup_button:
+        st.warning("Please enter a node ID.")
+
+    st.divider()
+    st.subheader("⚡ Auto-Relate Nodes")
+    auto_col1, auto_col2 = st.columns([2, 1])
+    with auto_col1:
+        auto_node_id = st.text_input("Node ID to auto-relate", key="auto_node_id", placeholder="e.g., doc1")
+    with auto_col2:
+        auto_relationship = st.text_input("Relationship label", value="auto_related")
+    
+    auto_col3, auto_col4, auto_col5 = st.columns(3)
+    with auto_col3:
+        auto_top_k = st.slider("Top K Similar Nodes", 1, 20, 3)
+    with auto_col4:
+        auto_min_score = st.slider("Minimum Cosine Similarity", 0.0, 1.0, 0.6, 0.05)
+    with auto_col5:
+        auto_bidirectional = st.checkbox("Create reverse edges", value=False)
+    
+    if st.button("⚡ Auto Relate"):
+        if not auto_node_id:
+            st.warning("Please provide a node ID to auto-relate.")
+        else:
+            try:
+                storage = st.session_state.storage
+                result = storage.auto_relate(
+                    auto_node_id.strip(),
+                    top_k=auto_top_k,
+                    min_score=auto_min_score,
+                    relationship=auto_relationship or "auto_related",
+                    bidirectional=auto_bidirectional,
+                )
+                created_edges = result.get("created_edges", [])
+                if created_edges:
+                    st.success(f"Created {len(created_edges)} new relationships for {result['node_id']}.")
+                    st.dataframe(pd.DataFrame(created_edges), use_container_width=True, hide_index=True)
+                else:
+                    st.info(
+                        f"No edges created. Try lowering the similarity threshold "
+                        f"(current min score: {auto_min_score})."
+                    )
+            except Exception as e:
+                st.error(f"Auto-relate failed: {str(e)}")
+
 # Upload Page
 elif page == "📤 Upload":
     st.header("📤 Upload Documents")
