@@ -20,6 +20,7 @@ from .ingestion import IngestionPipeline, parse_metadata
 from .llm_processor import LLMProcessor, get_llm_processor
 from .middleware import LoggingMiddleware, SecurityHeadersMiddleware
 from .models import (
+    AutoRelateRequest,
     ComparisonRequest,
     ComparisonResponse,
     EdgeCreate,
@@ -358,6 +359,36 @@ async def delete_node(
     except Exception as e:
         logger.error("Failed to delete node: %s", str(e), exc_info=True)
         raise StorageError(f"Failed to delete node: {str(e)}")
+
+
+@app.post("/nodes/{node_id}/auto-relate")
+async def auto_relate_node(
+    node_id: str,
+    payload: AutoRelateRequest,
+    storage: GraphMindStorage = Depends(get_storage),
+) -> Dict[str, Any]:
+    """Automatically create relationships for a node based on vector similarity."""
+    try:
+        result = storage.auto_relate(
+            node_id,
+            top_k=payload.top_k,
+            min_score=payload.min_score,
+            relationship=payload.relationship,
+            bidirectional=payload.bidirectional,
+        )
+        logger.info(
+            "Auto-related node %s with %d edges (relationship=%s, min_score=%.2f)",
+            node_id,
+            result["count"],
+            payload.relationship,
+            payload.min_score,
+        )
+        return result
+    except NotFoundError:
+        raise
+    except Exception as e:
+        logger.error("Failed to auto-relate node: %s", str(e), exc_info=True)
+        raise StorageError(f"Failed to auto-relate node: {str(e)}")
 
 
 @app.post("/edges")
@@ -735,7 +766,7 @@ async def hybrid_search(
             payload.top_k,
         )
         
-        # Get hybrid results (already uses parallel execution internally)
+        # Get hybrid results (already includes vector_score, graph_score, and info)
         hybrid_raw = storage.hybrid_search(
             payload.query_text, 
             payload.top_k, 
@@ -743,44 +774,26 @@ async def hybrid_search(
             query_embedding=payload.query_embedding
         )
         
-        # Get individual scores for breakdown in parallel
-        import asyncio
-        import concurrent.futures
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            vector_future = executor.submit(
-                storage.vector_search, 
-                payload.query_text, 
-                payload.top_k * 2,
-                payload.query_embedding,
-                None
-            )
-            graph_future = executor.submit(
-                storage.graph_search, 
-                payload.query_text, 
-                payload.top_k * 2
-            )
-            
-            vector_raw = vector_future.result()
-            graph_raw = graph_future.result()
-        
-        # Create score maps
-        vector_scores = {item["node_id"]: item["score"] for item in vector_raw}
-        graph_scores = {item["node_id"]: item["score"] for item in graph_raw}
-        
+        # Convert to response format
         results = [
             HybridSearchResult(
                 node_id=item["node_id"],
                 content=item["content"],
-                score=item["score"],
-                vector_score=vector_scores.get(item["node_id"], 0.0),
-                graph_score=graph_scores.get(item["node_id"], 0.0),
+                score=item.get("score", 0.0),
+                vector_score=item.get("vector_score", 0.0),
+                graph_score=item.get("graph_score", 0.0),
                 metadata=item.get("metadata", {}),
+                info=item.get("info"),
             )
             for item in hybrid_raw
         ]
         
-        return {"results": results, "query": payload.query_text, "alpha": alpha}
+        return {
+            "query_text": payload.query_text,
+            "vector_weight": payload.vector_weight,
+            "graph_weight": payload.graph_weight,
+            "results": results
+        }
     except Exception as e:
         logger.error("Hybrid search failed: %s", str(e), exc_info=True)
         raise StorageError(f"Hybrid search failed: {str(e)}")

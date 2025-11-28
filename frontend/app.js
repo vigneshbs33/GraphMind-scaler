@@ -869,6 +869,55 @@ async function createEdge() {
     }
 }
 
+async function autoRelateNode() {
+    const nodeIdInput = document.getElementById('auto-relate-node-id');
+    const nodeId = nodeIdInput?.value || document.getElementById('create-node-id')?.value;
+    const topK = parseInt(document.getElementById('auto-relate-top-k')?.value || '3');
+    const minScore = parseFloat(document.getElementById('auto-relate-min-score')?.value || '0.6');
+    const relationship = document.getElementById('auto-relate-relationship')?.value || 'auto_related';
+    const bidirectional = document.getElementById('auto-relate-bidirectional')?.checked || false;
+    const statusDiv = document.getElementById('crud-status');
+
+    if (!nodeId || !nodeId.trim()) {
+        if (statusDiv) {
+            statusDiv.innerHTML = '<div class="message error">❌ Please enter a node ID to auto-relate.</div>';
+        }
+        return;
+    }
+
+    if (!statusDiv) return;
+
+    statusDiv.innerHTML = `<div class="loading">Creating automatic relationships for <strong>${nodeId}</strong>...</div>`;
+
+    try {
+        const response = await fetch(`${API_BASE}/nodes/${encodeURIComponent(nodeId)}/auto-relate`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                top_k: topK,
+                min_score: minScore,
+                relationship: relationship,
+                bidirectional: bidirectional
+            })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (data.count > 0) {
+            statusDiv.innerHTML = `<div class="message success">✅ Created ${data.count} new ${relationship} relationships for ${nodeId}.</div>`;
+        } else {
+            statusDiv.innerHTML = `<div class="message warning">ℹ️ No similar nodes met the minimum score (${minScore}). Try lowering the threshold.</div>`;
+        }
+        loadStats();
+    } catch (error) {
+        statusDiv.innerHTML = `<div class="message error">❌ Auto-relate failed: ${error.message}</div>`;
+    }
+}
+
 // Graph visualization
 async function loadGraph() {
     const container = document.getElementById('graph-container');

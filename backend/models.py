@@ -11,6 +11,15 @@ from pydantic import BaseModel, Field, field_validator
 from .config import settings
 
 
+class AutoRelateRequest(BaseModel):
+    """Request payload for automatic relationship creation."""
+
+    top_k: int = Field(default=5, ge=1, le=settings.MAX_TOP_K, description="Number of similar nodes to consider.")
+    min_score: float = Field(default=0.6, ge=0.0, le=1.0, description="Minimum cosine similarity to create an edge.")
+    relationship: str = Field(default="auto_related", min_length=1, description="Relationship label for auto-created edges.")
+    bidirectional: bool = Field(default=False, description="Create reverse edges as well.")
+
+
 class NodeCreate(BaseModel):
     """Payload for creating a graph node.
 

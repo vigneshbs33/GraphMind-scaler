@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from collections import OrderedDict
 
 import chromadb
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class GraphMindStorage:
     """Coordinates ChromaDB vectors with a NetworkX knowledge graph."""
 
-    def __init__(self, chroma_path: Path, embedding_model: str) -> None:
+    def __init__(self, chroma_path: Path, embedding_model: str, mock_embeddings: bool = False) -> None:
         self.chroma_client = chromadb.PersistentClient(
             path=str(chroma_path),
             settings=ChromaSettings(anonymized_telemetry=False),
@@ -40,7 +40,11 @@ class GraphMindStorage:
             name="graphmind_nodes",
             metadata={"hnsw:space": "cosine"},
         )
-        self.embedding_model = SentenceTransformer(embedding_model)
+        self.mock_embeddings = mock_embeddings
+        if not mock_embeddings:
+            self.embedding_model = SentenceTransformer(embedding_model)
+        else:
+            self.embedding_model = None
         self.graph = nx.DiGraph()
         self.vector_to_graph_map: Dict[str, str] = {}
         self.merge_runs = 0
@@ -56,13 +60,39 @@ class GraphMindStorage:
             self.collection.count(),
         )
 
+    def _generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding using real model or mock for testing."""
+        if self.mock_embeddings:
+            return self._get_mock_embedding(text)
+        return self.embedding_model.encode(text).tolist()
+    
+    def _get_mock_embedding(self, text: str) -> List[float]:
+        """Get mock embedding for deterministic testing."""
+        text_lower = text.lower()
+        # Mock embeddings map based on keywords
+        if "redis" in text_lower and "caching" in text_lower:
+            return [0.90, 0.10, 0.00, 0.00, 0.00, 0.00]
+        elif "cache" in text_lower and "invalidation" in text_lower:
+            return [0.80, 0.15, 0.00, 0.00, 0.00, 0.00]
+        elif "redisgraph" in text_lower or ("redis" in text_lower and "graph" in text_lower):
+            return [0.70, 0.10, 0.60, 0.00, 0.00, 0.00]
+        elif "distributed" in text_lower and "system" in text_lower:
+            return [0.10, 0.05, 0.00, 0.90, 0.00, 0.00]
+        elif "graph" in text_lower and "algorithm" in text_lower:
+            return [0.05, 0.00, 0.90, 0.10, 0.00, 0.00]
+        elif "redis" in text_lower or "graph" in text_lower:
+            return [0.60, 0.05, 0.50, 0.00, 0.10, 0.00]
+        else:
+            # Default mock vector
+            return [0.50, 0.50, 0.00, 0.00, 0.00, 0.00]
+
     def add_node(self, node_id: Optional[str], content: str, metadata: Dict, embedding: Optional[List[float]] = None) -> str:
         """Insert a node across vector+graph stores."""
         from datetime import datetime
         
         node_id = node_id or str(uuid.uuid4())
         if embedding is None:
-            embedding = self.embedding_model.encode(content).tolist()
+            embedding = self._generate_embedding(content)
         safe_meta = metadata or {}
         safe_meta["created_at"] = datetime.utcnow().isoformat()
         self.collection.add(
@@ -144,7 +174,7 @@ class GraphMindStorage:
             # Check embedding cache
             embedding = self._get_cached_embedding(query)
             if embedding is None:
-                embedding = self.embedding_model.encode(query).tolist()
+                embedding = self._generate_embedding(query)
                 self._cache_embedding(query, embedding)
         else:
             embedding = query_embedding
@@ -164,22 +194,39 @@ class GraphMindStorage:
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
         distances = results.get("distances", [[]])[0]
-        raw_scores = [1 - d for d in distances]
-        if raw_scores:
-            min_score = min(raw_scores)
-            max_score = max(raw_scores)
-            norm = (
-                [(s - min_score) / (max_score - min_score) if max_score != min_score else 1.0 for s in raw_scores]
-            )
-        else:
-            norm = []
+        
+        # Calculate cosine similarity from distances (ChromaDB uses cosine distance)
+        # Cosine similarity = 1 - cosine distance
+        # But we need to ensure proper cosine similarity calculation
+        import numpy as np
+        query_vec = np.array(embedding)
+        query_norm = np.linalg.norm(query_vec)
+        
         payload = []
         for idx, node_id in enumerate(ids):
+            # Get node embedding for proper cosine similarity calculation
+            node_result = self.collection.get(ids=[node_id], include=["embeddings"])
+            if node_result.get("embeddings") and len(node_result["embeddings"]) > 0:
+                node_embedding = np.array(node_result["embeddings"][0])
+                # Calculate cosine similarity: dot product / (norm1 * norm2)
+                dot_product = np.dot(query_vec, node_embedding)
+                node_norm = np.linalg.norm(node_embedding)
+                if query_norm > 0 and node_norm > 0:
+                    cosine_sim = dot_product / (query_norm * node_norm)
+                    # Clamp to [0, 1] range
+                    cosine_sim = max(0.0, min(1.0, float(cosine_sim)))
+                else:
+                    cosine_sim = 0.0
+            else:
+                # Fallback to distance-based similarity
+                cosine_sim = 1.0 - distances[idx] if idx < len(distances) else 0.0
+                cosine_sim = max(0.0, min(1.0, cosine_sim))
+            
             payload.append(
                 {
                     "node_id": node_id,
                     "content": documents[idx] if idx < len(documents) else "",
-                    "score": norm[idx] if idx < len(norm) else 0.0,
+                    "score": cosine_sim,
                     "metadata": metadatas[idx] if idx < len(metadatas) else {},
                 }
             )
@@ -190,6 +237,30 @@ class GraphMindStorage:
             self._cache_query(cache_key, payload)
         
         return payload
+
+    def _calculate_graph_proximity_from_anchor(self, anchor_id: str, node_id: str) -> Tuple[float, int]:
+        """Calculate graph proximity score from anchor node using hop distance.
+        
+        Returns:
+            Tuple of (graph_score, hop_distance) where:
+            - graph_score: 1 / (1 + hops) - 0 if unreachable
+            - hop_distance: number of hops (0 if same node, -1 if unreachable)
+        """
+        if anchor_id == node_id:
+            return (1.0, 0)
+        
+        if not self.graph.has_node(anchor_id) or not self.graph.has_node(node_id):
+            return (0.0, -1)
+        
+        try:
+            if nx.has_path(self.graph, anchor_id, node_id):
+                hop_distance = nx.shortest_path_length(self.graph, anchor_id, node_id)
+                graph_score = 1.0 / (1.0 + hop_distance)
+                return (graph_score, hop_distance)
+            else:
+                return (0.0, -1)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return (0.0, -1)
 
     def graph_search(self, query: str, top_k: int) -> List[Dict]:
         """Traverse neighbors starting from vector seed with caching."""
@@ -234,73 +305,109 @@ class GraphMindStorage:
         query_embedding: Optional[List[float]] = None,
         relationship_weights: Optional[Dict[str, float]] = None
     ) -> List[Dict]:
-        """Blend vector and graph scores with optional relationship weighting using parallel execution."""
+        """Blend vector and graph scores with anchor-based graph proximity."""
         import concurrent.futures
         
-        # Run vector and graph searches in parallel using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            vector_future = executor.submit(self.vector_search, query, top_k * 2, query_embedding, None)
-            graph_future = executor.submit(self.graph_search, query, top_k * 2)
-            
-            # Wait for both to complete
-            vector_results = vector_future.result()
-            graph_results = graph_future.result()
+        # Get vector search results first to find anchor node
+        vector_results = self.vector_search(query, top_k * 2, query_embedding, None)
+        
+        if not vector_results:
+            return []
+        
+        # Use top vector result as anchor for graph proximity calculation
+        anchor_id = vector_results[0]["node_id"] if vector_results else None
+        
+        # Calculate graph proximity scores from anchor for all nodes
         combined: Dict[str, Dict] = {}
         
-        # Apply relationship weights to graph scores if provided
-        if relationship_weights:
-            for item in graph_results:
-                node_id = item["node_id"]
-                # Get edges for this node to calculate relationship-weighted score
-                if node_id in self.graph:
-                    incoming = list(self.graph.in_edges(node_id, data=True))
-                    outgoing = list(self.graph.out_edges(node_id, data=True))
-                    
-                    weighted_score = 0.0
-                    total_weight = 0.0
-                    
-                    for src, dst, attrs in incoming + outgoing:
-                        rel_type = attrs.get("relationship", "")
-                        weight = attrs.get("weight", 1.0)
-                        rel_weight = relationship_weights.get(rel_type, 1.0)
-                        weighted_score += weight * rel_weight
-                        total_weight += rel_weight
-                    
-                    if total_weight > 0:
-                        item["score"] = weighted_score / total_weight
-        
+        # First, populate with vector scores
         for item in vector_results:
             combined[item["node_id"]] = {
                 "vector": item["score"],
                 "graph": 0.0,
                 "content": item["content"],
                 "metadata": item["metadata"],
+                "hop": -1,
+                "edge_path": [],
+                "edge_weights": [],
             }
-        for item in graph_results:
-            bucket = combined.setdefault(
-                item["node_id"],
-                {"vector": 0.0, "graph": 0.0, "content": item["content"], "metadata": item["metadata"]},
-            )
-            bucket["graph"] = item["score"]
+        
+        # Calculate graph proximity scores from anchor
+        if anchor_id and anchor_id in self.graph:
+            # Get all nodes in graph that have vector scores
+            all_node_ids = set(combined.keys())
+            
+            for node_id in all_node_ids:
+                if node_id in self.graph:
+                    graph_score, hop_distance = self._calculate_graph_proximity_from_anchor(anchor_id, node_id)
+                    combined[node_id]["graph"] = graph_score
+                    combined[node_id]["hop"] = hop_distance
+                    
+                    # Get edge path info if reachable
+                    if hop_distance >= 0:
+                        try:
+                            path = nx.shortest_path(self.graph, anchor_id, node_id)
+                            edge_path = []
+                            edge_weights = []
+                            for i in range(len(path) - 1):
+                                src, dst = path[i], path[i + 1]
+                                if self.graph.has_edge(src, dst):
+                                    edge_data = self.graph.edges[src, dst]
+                                    rel_type = edge_data.get("relationship", "")
+                                    weight = edge_data.get("weight", 1.0)
+                                    edge_path.append(rel_type)
+                                    edge_weights.append(weight)
+                            combined[node_id]["edge_path"] = edge_path
+                            combined[node_id]["edge_weights"] = edge_weights
+                        except (nx.NetworkXNoPath, nx.NodeNotFound):
+                            pass
+        
+        # Apply relationship weights to graph scores if provided
+        if relationship_weights:
+            for node_id in combined:
+                if combined[node_id]["edge_path"]:
+                    # Adjust graph score based on relationship weights
+                    base_score = combined[node_id]["graph"]
+                    weighted_score = 0.0
+                    total_weight = 0.0
+                    for rel_type in combined[node_id]["edge_path"]:
+                        rel_weight = relationship_weights.get(rel_type, 1.0)
+                        weighted_score += base_score * rel_weight
+                        total_weight += rel_weight
+                    if total_weight > 0:
+                        combined[node_id]["graph"] = weighted_score / total_weight
+        
+        # Calculate final combined scores
         results = []
         for node_id, scores in combined.items():
             final = alpha * scores["vector"] + (1 - alpha) * scores["graph"]
-            reason = f"Vector: {scores['vector']:.2f}, Graph: {scores['graph']:.2f}, Combined: {final:.2f}"
+            
+            # Build info dict for result
+            info = {}
+            if scores["hop"] >= 0:
+                info["hop"] = scores["hop"]
+                if scores["edge_path"]:
+                    if len(scores["edge_path"]) == 1:
+                        info["edge"] = scores["edge_path"][0]
+                        info["edge_weight"] = scores["edge_weights"][0] if scores["edge_weights"] else 1.0
+                    else:
+                        info["edge_path"] = scores["edge_path"]
+                        info["weights"] = scores["edge_weights"]
+            
             results.append(
                 {
                     "node_id": node_id,
                     "content": scores["content"],
                     "score": final,
                     "metadata": scores["metadata"],
-                    "reasoning": reason,
+                    "vector_score": scores["vector"],
+                    "graph_score": scores["graph"],
+                    "info": info if info else None,
                 }
             )
+        
         results.sort(key=lambda item: item["score"], reverse=True)
         final_results = results[:top_k]
-        
-        # Cache hybrid search results
-        cache_key = f"hybrid:{query}:{top_k}:{alpha}"
-        self._cache_query(cache_key, final_results)
         
         return final_results
 
@@ -400,7 +507,7 @@ class GraphMindStorage:
             
             # Regenerate embedding if requested
             if regen_embedding:
-                embedding = self.embedding_model.encode(content).tolist()
+                embedding = self._generate_embedding(content)
                 self.collection.update(
                     ids=[node_id],
                     embeddings=[embedding],
@@ -549,23 +656,31 @@ class GraphMindStorage:
         else:
             traversal_graph = self.graph
         
-        # Use BFS to find all reachable nodes (handles cycles by visited set)
+        # Use BFS to find all reachable nodes (handles cycles by tracking visited nodes per depth)
         visited = set()
         queue = [(start_id, 0, [start_id])]
         paths_dict = {}
         
-        while queue and len(visited) < max_nodes:
+        while queue and len(paths_dict) < max_nodes:
             node_id, current_depth, path = queue.pop(0)
             
-            if node_id in visited or current_depth > depth:
+            # Skip if depth exceeded
+            if current_depth > depth:
                 continue
-                
-            visited.add(node_id)
-            paths_dict[node_id] = (current_depth, path)
             
+            # Visit node if not already visited (allows cycles but prevents infinite loops)
+            if node_id not in visited:
+                visited.add(node_id)
+                # Only add nodes that are not the start node (distance > 0)
+                # or if depth is 0 and we want the start node itself
+                if current_depth > 0 or node_id != start_id:
+                    paths_dict[node_id] = (current_depth, path)
+            
+            # Continue traversal if depth allows
             if current_depth < depth:
                 for neighbor in traversal_graph.successors(node_id):
-                    if neighbor not in visited:
+                    # Allow revisiting nodes at different depths (for cycle handling)
+                    if neighbor not in visited or current_depth + 1 <= depth:
                         queue.append((neighbor, current_depth + 1, path + [neighbor]))
         
         # Build traversal results with paths
@@ -600,6 +715,80 @@ class GraphMindStorage:
         results.sort(key=lambda x: x["distance"])
         
         return results
+
+    def auto_relate(
+        self,
+        node_id: str,
+        top_k: int = 5,
+        min_score: float = 0.6,
+        relationship: str = "auto_related",
+        bidirectional: bool = False,
+    ) -> Dict[str, Any]:
+        """Automatically create edges to similar nodes based on vector similarity."""
+        from .exceptions import NotFoundError, ValidationError
+
+        if node_id not in self.graph:
+            raise NotFoundError(f"Node {node_id} not found")
+
+        chroma_payload = self.collection.get(ids=[node_id], include=["embeddings"])
+        embeddings = chroma_payload.get("embeddings") or []
+        if not embeddings:
+            raise ValidationError("Node embedding not found for auto relation")
+
+        query_embedding = embeddings[0]
+        collection_count = max(int(self.collection.count()), 1)
+        n_results = min(top_k + 1, collection_count)
+
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results,
+            include=["ids", "distances"],
+        )
+
+        ids = results.get("ids", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        created_edges: List[Dict[str, Any]] = []
+
+        for idx, target_id in enumerate(ids):
+            if not target_id or target_id == node_id:
+                continue
+            if target_id not in self.graph:
+                continue
+
+            distance = distances[idx] if idx < len(distances) else 1.0
+            score = max(0.0, min(1.0, 1.0 - float(distance)))
+            if score < min_score:
+                continue
+
+            self.graph.add_edge(
+                node_id,
+                target_id,
+                relationship=relationship,
+                weight=score,
+            )
+            if bidirectional:
+                self.graph.add_edge(
+                    target_id,
+                    node_id,
+                    relationship=relationship,
+                    weight=score,
+                )
+
+            created_edges.append(
+                {
+                    "source_id": node_id,
+                    "target_id": target_id,
+                    "relationship": relationship,
+                    "weight": score,
+                }
+            )
+
+        return {
+            "node_id": node_id,
+            "created_edges": created_edges,
+            "count": len(created_edges),
+            "min_score": min_score,
+        }
 
     def multi_hop_reasoning(self, query: str, max_hops: int = 3) -> List[Dict]:
         """Multi-hop reasoning: find seed nodes via vector search, then traverse graph."""

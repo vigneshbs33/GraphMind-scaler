@@ -228,6 +228,20 @@
                                 <button class="autofill-btn" onclick="autofillCreateEdge()">🎯 Autofill</button>
                             </div>
                         </div>
+                        <div class="card crud-card">
+                            <h3>Auto-Relate Node</h3>
+                            <p class="helper-text">Automatically connect a node to its most similar neighbors using cosine similarity.</p>
+                            <div class="crud-form">
+                                <input type="text" id="auto-relate-node-id" class="search-input" placeholder="Node ID to auto-relate">
+                                <input type="number" id="auto-relate-top-k" class="search-input input-medium" value="3" min="1" max="20" placeholder="Top K similar nodes">
+                                <input type="number" id="auto-relate-min-score" class="search-input input-medium" value="0.6" min="0" max="1" step="0.05" placeholder="Minimum similarity">
+                                <input type="text" id="auto-relate-relationship" class="search-input" value="auto_related" placeholder="Relationship label">
+                                <label class="checkbox-inline">
+                                    <input type="checkbox" id="auto-relate-bidirectional"> Create reverse edges
+                                </label>
+                                <button class="btn btn-primary" onclick="autoRelateNode()">⚡ Auto Relate</button>
+                            </div>
+                        </div>
                     </div>
                     <div id="crud-status"></div>
                 </div>
@@ -236,11 +250,15 @@
             <!-- Nodes Tab -->
             <div id="nodes-tab" class="tab-content">
                 <div class="card">
-                    <h2>Node Management</h2>
+                    <h2>Node Intelligence</h2>
+                    <p class="helper-text">Search for any node by ID to view its content, connections, and an AI-generated summary powered by Gemini.</p>
                     <div class="search-box">
-                        <input type="text" id="node-lookup-id" class="search-input" placeholder="Enter node ID to view/edit...">
+                        <input type="text" id="node-lookup-id" class="search-input" placeholder="Enter node ID (e.g., doc1)">
                         <button class="btn btn-primary" onclick="lookupNode()">View Node</button>
                         <button class="autofill-btn" onclick="autofillNodeLookup()">🎯 Autofill</button>
+                    </div>
+                    <div class="hint-card">
+                        <p>💡 Tip: Click any search result or graph node to jump here automatically.</p>
                     </div>
                     <div id="node-details-container"></div>
                 </div>

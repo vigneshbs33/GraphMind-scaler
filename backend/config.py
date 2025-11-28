@@ -40,7 +40,7 @@ class Settings(BaseSettings):
 
     # LLM settings
     LLM_PROVIDER: str = "gemini"  # Options: "mock", "gemini", "claude", "ollama"
-    GEMINI_API_KEY: str = Field(default="AIzaSyASunHPAbRNSxHUucdAfay1V_-Chch9MiQ", description="Gemini API key")
+    GEMINI_API_KEY: str = Field(default="AIzaSyA1ABkWVLbavg1VdJk4a0JwgDf7d1zT9uM", description="Gemini API key")
     GEMINI_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
     GEMINI_TIMEOUT: int = 30
     CLAUDE_API_KEY: str = ""
